@@ -1,0 +1,801 @@
+import {
+  LayoutChangeEvent,
+  NativeScrollEvent,
+  NativeSyntheticEvent,
+  Platform,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  View,
+} from 'react-native';
+import {
+  Dispatch,
+  SetStateAction,
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
+import {
+  NativeStackScreenProps,
+  createNativeStackNavigator,
+} from '@react-navigation/native-stack';
+import { BottomTabScreenProps } from '@react-navigation/bottom-tabs';
+import { CompositeScreenProps, useFocusEffect } from '@react-navigation/native';
+import type { ListRenderItemInfo } from 'react-native';
+import type { HomeParamList, SearchParamList } from '../navigation/linking';
+import { ProfileCard }  from './profile-card';
+import { DuoliciousTopNavBar } from './top-nav-bar';
+import { SearchFilterScreen } from './search-filter-screen';
+import { DefaultText } from './default-text';
+import { DefaultFlatList, FetchPageError } from './default-flat-list';
+import { japi } from '../api/api';
+import { TopNavBarButton } from './top-nav-bar-button';
+import { LinearGradient } from 'expo-linear-gradient';
+import { isMobile } from '../util/util';
+import * as _ from 'lodash';
+import Ionicons from '@expo/vector-icons/Ionicons';
+import { ClubItem, sortClubs } from '../club/club';
+import { listen, lastEvent } from '../events/events';
+import { searchQueue } from '../api/queue';
+import { useScrollbar } from './navigation/scroll-bar-hooks';
+import { useAppTheme } from '../app-theme/app-theme';
+import { useIsWebLoggedOut } from '../events/signed-in-user';
+import { encodedAnonymousAnswers } from '../events/anonymous-answers';
+import { getPublicSearchFilters } from '../events/public-search-filters';
+import { genders } from '../data/option-groups';
+import {
+  areSearchResultsRecent,
+  consumeStaleSearchResults,
+  recordSearchResultsFetch,
+} from '../events/stale-search-results';
+import {
+  listenSearchRequests,
+  requestSearch,
+  whileSearching,
+} from '../events/search-requests';
+import {
+  flushSearchFilterWrites,
+  getSearchFilters,
+  recordSearchedFilters,
+} from '../events/search-filters';
+import { SearchFiltersHint } from './hints/search-filters-hint';
+import { seenSearchFiltersHint } from '../kv-storage/seen-hints/seen-search-filters-hint';
+import { useHasRightPane } from './navigation/web-layout';
+
+type SearchScreenProps = CompositeScreenProps<
+  NativeStackScreenProps<SearchParamList, 'Search Screen'>,
+  BottomTabScreenProps<HomeParamList>
+>;
+
+const styles = StyleSheet.create({
+  safeAreaView: {
+    flex: 1,
+  },
+  listContainerStyle: {
+    paddingTop: 0,
+    rowGap: 5,
+  },
+  listColumnWraperStyle: {
+    gap: 5,
+    paddingHorizontal: 5,
+  },
+  clubsScrollViewContainer: {
+    alignItems: 'center',
+  },
+  clubsContentContainerContainer: {
+    borderRadius: 5,
+    overflow: 'hidden',
+    alignSelf: 'center',
+    width: '100%',
+    maxWidth: 600,
+  },
+  clubTitle: {
+    fontSize: 18,
+    fontWeight: '900',
+    paddingLeft: 5,
+    paddingRight: 10,
+    paddingVertical: 5,
+  },
+  clubContainerEveryone: {
+    marginHorizontal: 30,
+    borderRadius: 5,
+    overflow: 'hidden',
+  },
+  clubContainer: {
+    borderRadius: 5,
+    overflow: 'hidden',
+  },
+});
+
+const minCardWidth = 125;
+
+const scrollIndicatorInsets = {
+  top: 50,
+};
+
+const getStateFromClubItems = (cs: ClubItem[] | undefined) => {
+  const clubs = cs ?? [];
+
+  const hasClubs = clubs
+    .length > 0;
+  const selectedClub = clubs
+    .find((c) => c.search_preference === true)
+    ?.name;
+
+  return { hasClubs, selectedClub };
+};
+
+const Stack = createNativeStackNavigator();
+
+const SearchTab = () => {
+  return (
+    <Stack.Navigator
+      screenOptions={{
+        headerShown: false,
+        presentation: 'card'
+      }}
+    >
+      <Stack.Screen
+        name="Search Screen"
+        component={SearchScreen_}
+        options={{ title: 'Search' }}
+      />
+      <Stack.Screen name="Search Filter Screen" component={SearchFilterScreen} />
+    </Stack.Navigator>
+  );
+};
+
+const ProfileCardMemo = memo(ProfileCard);
+
+type PageItem = {
+  prospect_person_id: number
+  prospect_uuid: string
+  url_slug: string | null
+  profile_photo_uuid: string
+  profile_photo_blurhash: string
+  name: string
+  age: number
+  match_percentage: number
+  person_messaged_prospect: boolean
+  prospect_messaged_person: boolean
+  verified: boolean
+  verification_required_to_view: string | null
+};
+
+const publicSearchFilterParams = (): string => {
+  const { gender, age } = getPublicSearchFilters();
+
+  return [
+    gender && gender.length < genders.length &&
+      `&gender=${encodeURIComponent(JSON.stringify(gender))}`,
+    typeof age?.min_age === 'number' && `&min_age=${age.min_age}`,
+    typeof age?.max_age === 'number' && `&max_age=${age.max_age}`,
+  ].filter(Boolean).join('');
+};
+
+const fetchPageWithoutQueue = async (
+  club: string | null,
+  pageNumber: number,
+  isPublic: boolean,
+): Promise<PageItem[] | FetchPageError | null> => {
+  const resultsPerPage = 50;
+  const offset = resultsPerPage * (pageNumber - 1);
+
+  // Logged-out web users have no profile to rank against, so the public search
+  // is ranked by the answers they've given in the Q&A tab (when they've given
+  // any). Signed-in users are ranked server-side from their saved answers.
+  const answers = isPublic ? encodedAnonymousAnswers() : null;
+  const answersParam = answers ? `&answers=${answers}` : '';
+  const filterParams = isPublic ? publicSearchFilterParams() : '';
+
+  const response = await japi<PageItem[]>(
+    'get',
+    (isPublic ? '/public-search' : '/search') +
+    `?n=${resultsPerPage}` +
+    `&o=${offset}` +
+    `&club=${encodeURIComponent(club === null ? '\0' : club)}` +
+    answersParam +
+    filterParams
+  );
+
+  if (pageNumber === 1) {
+    recordSearchResultsFetch(response.ok);
+  }
+
+  if (response.status === 429) {
+    return {
+      errorText:
+        "You’re searching too quickly. Wait a minute or two, then try again.",
+    };
+  }
+
+  return response.ok && response.json ? response.json : null;
+};
+
+const fetchPage = (
+  club: string | null,
+  isPublic: boolean,
+) => async (
+  pageNumber: number
+): Promise<PageItem[] | FetchPageError | null> => {
+  const filters = getSearchFilters();
+
+  await flushSearchFilterWrites();
+
+  const page = await searchQueue.addTask(
+    async () => fetchPageWithoutQueue(club, pageNumber, isPublic));
+
+  if (pageNumber === 1 && Array.isArray(page)) {
+    recordSearchedFilters(filters);
+  }
+
+  return page;
+};
+
+type ClubSelectorProps = {
+  selectedClub: string | null;
+  onChangeSelectedClub: (s: string | null) => void;
+};
+
+const LeftContinuation = ({scrollLeft}: {scrollLeft: () => void}) => {
+  const { appTheme } = useAppTheme();
+
+  if (isMobile()) {
+    return (
+      <LinearGradient
+        start={{x: 0, y: 0 }}
+        end={{x: 1, y: 0 }}
+        colors={['#00000044', '#00000000']}
+        style={{
+          position: 'absolute',
+          top: 0,
+          left: 0,
+
+          height: '100%',
+          width: 10,
+
+          zIndex: 999,
+        }}
+      />
+    );
+  } else {
+    return (
+      <Pressable
+        onPress={scrollLeft}
+        style={{
+          position: 'absolute',
+          top: 0,
+          left: 0,
+
+          height: '100%',
+          width: 40,
+
+          zIndex: 999,
+        }}
+      >
+        <LinearGradient
+          start={{x: 0, y: 0 }}
+          end={{x: 1, y: 0 }}
+          locations={[0.0, 0.8, 1.0]}
+          colors={[
+            `${appTheme.primaryColor}ff`,
+            `${appTheme.primaryColor}e5`,
+            `${appTheme.primaryColor}00`,
+          ]}
+          style={{
+            height: '100%',
+            width: '100%',
+            justifyContent: 'center',
+            alignItems: 'flex-start',
+          }}
+        >
+          <Ionicons
+            style={{
+              fontSize: 26,
+              color: appTheme.secondaryColor,
+            }}
+            name="chevron-back"
+          />
+        </LinearGradient>
+      </Pressable>
+    );
+  }
+};
+
+const RightContinuation = ({scrollRight}: {scrollRight: () => void}) => {
+  const { appTheme } = useAppTheme();
+
+  if (isMobile()) {
+    return (
+      <LinearGradient
+        start={{x: 0, y: 0 }}
+        end={{x: 1, y: 0 }}
+        colors={['#00000000', '#00000044']}
+        style={{
+          position: 'absolute',
+          top: 0,
+          right: 0,
+
+          height: '100%',
+          width: 10,
+
+          zIndex: 999,
+        }}
+      />
+    );
+  } else {
+    return (
+      <Pressable
+        onPress={scrollRight}
+        style={{
+          position: 'absolute',
+          top: 0,
+          right: 0,
+
+          height: '100%',
+          width: 40,
+
+          zIndex: 999,
+        }}
+      >
+        <LinearGradient
+          start={{x: 0, y: 0 }}
+          end={{x: 1, y: 0 }}
+          locations={[0.0, 0.2, 1.0]}
+          colors={[
+            `${appTheme.primaryColor}00`,
+            `${appTheme.primaryColor}e5`,
+            `${appTheme.primaryColor}ff`,
+          ]}
+          style={{
+            height: '100%',
+            width: '100%',
+            justifyContent: 'center',
+            alignItems: 'flex-end',
+          }}
+        >
+          <Ionicons
+            style={{
+              fontSize: 26,
+              color: appTheme.secondaryColor,
+            }}
+            name="chevron-forward"
+          />
+        </LinearGradient>
+      </Pressable>
+    );
+  }
+};
+
+const ClubSelector = (props: ClubSelectorProps) => {
+  const { appTheme } = useAppTheme();
+
+  const scrollJumpSize = 150;
+
+  const scrollViewRef = useRef<ScrollView>(null);
+  const scrollXRef = useRef(0);
+
+  const hasJumpedToClubRef = useRef(false);
+
+  const [isTop, setIsTop] = useState(true);
+  const [isBottom, setIsBottom] = useState(true);
+  const [contentWidth, setContentWidth] = useState(0);
+  const [containerWidth, setContainerWidth] = useState(0);
+  const [clubs, setClubs] = useState<ClubItem[]>(
+    sortClubs(lastEvent('updated-clubs')));
+
+
+  const checkIsTop = useCallback((nativeEvent: NativeScrollEvent) => {
+    const isCloseToTop = nativeEvent.contentOffset.x <= 10;
+
+    setIsTop(isCloseToTop);
+  }, [setIsTop]);
+
+  const checkIsBottom = useCallback((nativeEvent: NativeScrollEvent) => {
+    const isCloseToBottom = (
+      nativeEvent.layoutMeasurement.width +
+      nativeEvent.contentOffset.x) >= nativeEvent.contentSize.width - 10;
+
+    setIsBottom(isCloseToBottom);
+  }, [setIsBottom]);
+
+  const onScroll = useCallback(({ nativeEvent }: NativeSyntheticEvent<NativeScrollEvent>) => {
+    scrollXRef.current = nativeEvent.contentOffset.x;
+
+    checkIsTop(nativeEvent);
+    checkIsBottom(nativeEvent);
+  }, [checkIsTop, checkIsBottom]);
+
+  const onContentSizeChange = useCallback((width: number) =>
+    setContentWidth(width), []);
+
+  const onScrollViewLayout = useCallback(({ nativeEvent }: LayoutChangeEvent) =>
+    setContainerWidth(nativeEvent.layout.width), []);
+
+  const onSelectedClubLayout = useCallback(({ nativeEvent }: LayoutChangeEvent) => {
+    (async () => {
+      if (!scrollViewRef.current) {
+        return;
+      }
+
+      if (hasJumpedToClubRef.current) {
+        return;
+      }
+
+      scrollViewRef.current.scrollTo({
+        x: nativeEvent.layout.x - scrollJumpSize,
+        animated: false,
+      });
+
+      hasJumpedToClubRef.current = true;
+    })();
+  }, []);
+
+  const scrollLeft = useCallback(() => {
+    if (!scrollViewRef.current) {
+      return;
+    }
+    scrollViewRef.current.scrollTo({
+      x: scrollXRef.current - scrollJumpSize,
+      animated: true,
+    });
+  }, []);
+
+  const scrollRight = useCallback(() => {
+    if (!scrollViewRef.current) {
+      return;
+    }
+    scrollViewRef.current.scrollTo({
+      x: scrollXRef.current + scrollJumpSize,
+      animated: true,
+    });
+  }, []);
+
+  useEffect(() => {
+    if (containerWidth > 0 && contentWidth > 0) {
+      setIsBottom(containerWidth >= contentWidth);
+    }
+  }, [containerWidth, contentWidth]);
+
+  useEffect(() => {
+    return listen(
+      'updated-clubs',
+      (maybeCs: ClubItem[] | undefined) => {
+        hasJumpedToClubRef.current = false;
+
+        const sortedCs = sortClubs(maybeCs);
+        setClubs(sortedCs);
+      }
+    );
+  }, []);
+
+  const dynamicStyles = StyleSheet.create({
+    selectedClubText: {
+      fontSize: 16,
+      fontFamily: 'Trueno',
+      paddingHorizontal: 10,
+      paddingVertical: 5,
+      color: appTheme.primaryColor,
+      backgroundColor: appTheme.secondaryColor,
+    },
+    unselectedClubText: {
+      fontSize: 16,
+      fontFamily: 'Trueno',
+      paddingHorizontal: 10,
+      paddingVertical: 5,
+      color: appTheme.secondaryColor,
+    },
+  });
+
+  if (!clubs || !clubs.length) {
+    return null;
+  }
+
+  return (
+    <View
+      style={{
+        width: '100%',
+        alignItems: 'stretch',
+        alignSelf: 'center',
+        paddingTop: 10,
+        paddingBottom: 5,
+        paddingHorizontal: 5,
+        overflow: 'hidden',
+        zIndex: 9999,
+        opacity: 0.9,
+        backgroundColor: appTheme.primaryColor,
+      }}
+    >
+      <View style={styles.clubsContentContainerContainer}>
+        <ScrollView
+          ref={scrollViewRef}
+          horizontal={true}
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={styles.clubsScrollViewContainer}
+          onScroll={onScroll}
+          onContentSizeChange={onContentSizeChange}
+          onLayout={onScrollViewLayout}
+        >
+          <DefaultText style={styles.clubTitle}>
+            CLUBS
+          </DefaultText>
+
+          <Pressable
+            style={styles.clubContainerEveryone}
+            onPress={() => props.onChangeSelectedClub(null)}
+          >
+            <DefaultText
+              style={
+                props.selectedClub === null ?
+                  dynamicStyles.selectedClubText :
+                  dynamicStyles.unselectedClubText
+              }
+            >
+              Everyone
+            </DefaultText>
+          </Pressable>
+
+          {clubs.map((club) =>
+            <Pressable
+              style={styles.clubContainer}
+              key={club.name}
+              onPress={() => props.onChangeSelectedClub(club.name)}
+              onLayout={
+                props.selectedClub === club.name && !hasJumpedToClubRef.current ?
+                  onSelectedClubLayout :
+                  undefined
+              }
+            >
+              <DefaultText
+                style={
+                  props.selectedClub === club.name ?
+                    dynamicStyles.selectedClubText :
+                    dynamicStyles.unselectedClubText
+                }
+              >
+                {club.name}
+              </DefaultText>
+            </Pressable>
+          )}
+        </ScrollView>
+
+        {!isTop && <LeftContinuation scrollLeft={scrollLeft} />}
+        {!isBottom && <RightContinuation scrollRight={scrollRight} />}
+      </View>
+    </View>
+  );
+};
+
+const ListHeaderComponent = ({
+  hasClubs,
+  selectedClub,
+  setSelectedClub,
+}: {
+  hasClubs: boolean,
+  selectedClub: string | null,
+  setSelectedClub: Dispatch<SetStateAction<string | null>>,
+}) => {
+  if (hasClubs) {
+    return <ClubSelector
+      selectedClub={selectedClub}
+      onChangeSelectedClub={setSelectedClub}
+    />;
+  }
+
+  return null;
+};
+
+const SearchScreen_ = ({navigation}: SearchScreenProps) => {
+  const isPublic = useIsWebLoggedOut();
+  const hasFilterPanel = useHasRightPane();
+
+  const {
+    hasClubs: initialHasClubs,
+    selectedClub: initialSelectedClub,
+  } = getStateFromClubItems(lastEvent<ClubItem[]>('updated-clubs'));
+
+  const listRef = useRef<{ refresh: () => Promise<void> } | null>(null);
+
+  const {
+    onLayout,
+    onContentSizeChange,
+    onScroll,
+    showsVerticalScrollIndicator,
+    observeListRef,
+  } = useScrollbar('search');
+
+  const [
+    hasClubs,
+    setHasClubs,
+  ] = useState<boolean>(initialHasClubs);
+
+  const [
+    selectedClub,
+    setSelectedClub,
+  ] = useState<string | null>(initialSelectedClub ?? null);
+
+  const [isFiltersHintDismissed, setIsFiltersHintDismissed] = useState(true);
+
+  const [width, setWidth] = useState<number | null>(null);
+
+  const onLayoutScreen = useCallback(({ nativeEvent }: LayoutChangeEvent) => {
+    if (nativeEvent.layout.width > 0) {
+      setWidth(nativeEvent.layout.width);
+    }
+  }, []);
+
+  const numColumns = isMobile() || width === null
+    ? 2
+    : _.clamp(Math.floor(width / minCardWidth), 2, 4);
+
+  useEffect(() => {
+    (async () => {
+      if (!(await seenSearchFiltersHint())) {
+        setIsFiltersHintDismissed(false);
+      }
+    })();
+  }, []);
+
+  const dismissFiltersHint = useCallback(() => {
+    setIsFiltersHintDismissed(true);
+    seenSearchFiltersHint(true);
+  }, []);
+
+  const onPressRefresh = useCallback(async () => {
+    await listRef.current?.refresh();
+  }, []);
+
+  // Changing a search filter or answering a Q&A question re-ranks these
+  // results, so refetch when the tab regains focus if they've gone stale since
+  // we last fetched.
+  useFocusEffect(
+    useCallback(() => {
+      if (consumeStaleSearchResults()) {
+        whileSearching(onPressRefresh);
+      }
+    }, [onPressRefresh])
+  );
+
+  useEffect(() => {
+    return listenSearchRequests(async () => {
+      if (!consumeStaleSearchResults() && areSearchResultsRecent()) return;
+      await onPressRefresh();
+    });
+  }, [onPressRefresh]);
+
+  const onPressOptions = useCallback(() => {
+    dismissFiltersHint();
+    navigation.navigate('Search Filter Screen', {
+      screen: 'Search Filter Tab',
+    });
+  }, [selectedClub, dismissFiltersHint]);
+
+  useEffect(() => {
+    whileSearching(onPressRefresh);
+  }, [selectedClub]);
+
+  useEffect(() => {
+    return listen(
+      'updated-clubs',
+      (cs: ClubItem[] | undefined) => {
+        const { hasClubs, selectedClub } = getStateFromClubItems(cs);
+
+        setHasClubs(hasClubs);
+
+        setSelectedClub((current) =>
+          selectedClub ??
+          ((cs ?? []).some((c) => c.name === current) ? current : null));
+      }
+    );
+  }, []);
+
+  const fetchSearchPage = useMemo(
+    () => fetchPage(selectedClub, isPublic),
+    [selectedClub, isPublic]);
+
+  const listHeaderComponent = useMemo(() =>
+    <ListHeaderComponent
+      hasClubs={hasClubs}
+      selectedClub={selectedClub}
+      setSelectedClub={setSelectedClub}
+    />,
+    [hasClubs, selectedClub]);
+
+  const cardWidth = (width ?? 0) / numColumns;
+
+  const renderItem = useCallback(
+    ({item}: ListRenderItemInfo<PageItem>) =>
+      <ProfileCardMemo
+        item={item}
+        numColumns={numColumns}
+        cardWidth={cardWidth}
+      />,
+    [numColumns, cardWidth]);
+
+  const stickyHeaderIndices = useMemo(() => hasClubs ? [0] : [], [hasClubs]);
+
+  return (
+    <View style={styles.safeAreaView} onLayout={onLayoutScreen}>
+      {!hasFilterPanel &&
+        <DuoliciousTopNavBar>
+          {Platform.OS === 'web' &&
+            <TopNavBarButton
+              onPress={requestSearch}
+              iconName="refresh"
+              position="left"
+              secondary={true}
+              label="Refresh"
+            />
+          }
+          <View
+            style={{
+              position: 'absolute',
+              top: 0,
+              height: '100%',
+              flexDirection: 'row',
+              alignItems: 'center',
+              justifyContent: 'flex-end',
+              right: 10,
+            }}
+          >
+            <View>
+              <TopNavBarButton
+                onPress={onPressOptions}
+                iconName="options-outline"
+                position={null}
+                secondary={false}
+                label="Filters"
+              />
+              {!isFiltersHintDismissed && !isPublic &&
+                <SearchFiltersHint onDismiss={dismissFiltersHint} />
+              }
+            </View>
+          </View>
+        </DuoliciousTopNavBar>
+      }
+      {width !== null && <DefaultFlatList
+        key={
+          // This is needed to trigger a re-render when the sticky header
+          // indicies change. Without this, the header is blank on Android.
+          String(hasClubs)
+        }
+        ref={listRef}
+        innerRef={observeListRef}
+        emptyText={
+          "No matches found. Try adjusting your search filters to include " +
+          "more people."
+        }
+        errorText={
+          "Something went wrong while fetching search results"
+        }
+        endText={
+          "See more matches by adjusting your search filters or clubs"
+        }
+        fetchPage={fetchSearchPage}
+        dataKey={JSON.stringify([selectedClub, isPublic])}
+        hideListHeaderComponentWhenEmpty={!hasClubs}
+        hideListHeaderComponentWhenLoading={!hasClubs}
+        numColumns={numColumns}
+        contentContainerStyle={styles.listContainerStyle}
+        ListHeaderComponent={listHeaderComponent}
+        renderItem={renderItem}
+        scrollIndicatorInsets={scrollIndicatorInsets}
+        onLayout={onLayout}
+        onContentSizeChange={onContentSizeChange}
+        onScroll={onScroll}
+        showsVerticalScrollIndicator={showsVerticalScrollIndicator}
+        stickyHeaderHiddenOnScroll={hasClubs}
+        stickyHeaderIndices={stickyHeaderIndices}
+        columnWrapperStyle={styles.listColumnWraperStyle}
+      />}
+    </View>
+  );
+};
+
+export {
+  SearchTab,
+  PageItem,
+};
